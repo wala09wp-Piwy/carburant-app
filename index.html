@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Saisie carburant</title>
+
+<style>
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f3f6fb;color:#1d2433;padding:16px}
+.card{background:#fff;border-radius:16px;padding:16px;margin-bottom:14px;box-shadow:0 6px 18px #0001}
+h1,h2{margin-top:0;color:#0a318f}
+label{font-weight:bold;display:block;margin-top:10px}
+input,select,button{width:100%;padding:12px;margin-top:5px;border-radius:10px;border:1px solid #ccc;font-size:16px;box-sizing:border-box}
+button{border:none;background:#0a318f;color:white;font-weight:bold;margin-top:14px}
+button.success{background:#067647}
+button.secondary{background:#475467}
+.ok{background:#ecfdf3;color:#067647;padding:10px;border-radius:10px}
+.err{background:#fef3f2;color:#b42318;padding:10px;border-radius:10px}
+.info{background:#eef4ff;color:#0a318f;padding:10px;border-radius:10px}
+.badge{display:inline-block;background:#eef4ff;color:#0a318f;padding:8px 12px;border-radius:999px;font-weight:bold;margin-top:8px}
+.small{font-size:13px;color:#667085}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+  <h1>⛽ Saisie carburant</h1>
+  <div id="etat" class="info">Application prête.</div>
+</div>
+
+<div class="card">
+  <h2>🚗 Véhicule</h2>
+
+  <label>Véhicule sélectionné</label>
+  <div id="vehiculeInfo" class="badge">Aucun véhicule sélectionné</div>
+
+  <label>Changer de véhicule</label>
+  <select id="vehiculeSelect" onchange="selectVehicleFromList()">
+    <option value="">-- Sélectionner un véhicule --</option>
+  </select>
+
+  <button class="secondary" onclick="refreshVehicles()">🔄 Actualiser les véhicules</button>
+
+  <p class="small">
+    Les véhicules sont gardés hors ligne avec uniquement leur ID interne et leur ticket.
+    L’ID n’est jamais affiché.
+  </p>
+</div>
+
+<div class="card">
+  <h2>⛽ Plein carburant</h2>
+
+  <label>Date et heure</label>
+  <input id="dateHeure">
+
+  <label>Kilométrage total</label>
+  <input id="kmTotal" type="number">
+
+  <label>Kilomètres parcourus</label>
+  <input id="kmParcouru" type="number">
+
+  <label>Litrage</label>
+  <input id="litrage" type="number" step="0.01">
+
+  <label>Conso moyenne L/100</label>
+  <input id="conso" readonly placeholder="Calcul automatique non enregistré">
+
+  <button onclick="savePlein()">✅ Enregistrer</button>
+  <button class="success" onclick="syncNow()">🔄 Synchroniser</button>
+</div>
+
+<div class="card">
+  <h2>📦 En attente</h2>
+  <div id="pending">0 saisie en attente</div>
+</div>
+
+<script>
+const API_KEY = "7539b07533ae49b51e523a1fca961f710fda5640";
+const DOC_ID = "cQjMJPmF91ep83Bp1MHPbW";
+const API = "https://docs.getgrist.com/api/docs";
+
+const TABLE_VOITURE = "Voiture";
+const TABLE_SAISIES = "Saisies";
+
+const $ = id => document.getElementById(id);
+
+window.addEventListener("load", async () => {
+  $("dateHeure").value = nowFr();
+
+  $("kmParcouru").addEventListener("input", calcConso);
+  $("litrage").addEventListener("input", calcConso);
+
+  await refreshVehicles(false);
+
+  const idFromQr = new URLSearchParams(location.search).get("id");
+
+  if (idFromQr) {
+    selectVehicleById(idFromQr);
+    setEtat("Véhicule sélectionné depuis le QR code.", "ok");
+  } else {
+    loadSelectedVehicle();
+  }
+
+  updatePending();
+
+  if (navigator.onLine) syncNow(false);
+});
+
+window.addEventListener("online", async () => {
+  await refreshVehicles(false);
+  syncNow(false);
+});
+
+function nowFr(){
+  const d = new Date();
+  const p = n => String(n).padStart(2,"0");
+  return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function num(v){
+  const n = Number(String(v || "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function setEtat(msg, type="info"){
+  $("etat").className = type;
+  $("etat").textContent = msg;
+}
+
+function calcConso(){
+  const km = num($("kmParcouru").value);
+  const litres = num($("litrage").value);
+
+  $("conso").value = km && litres
+    ? ((litres / km) * 100).toFixed(2)
+    : "";
+}
+
+/* =========================
+   VEHICULES OFFLINE
+   Stockage uniquement : id + ticket
+========================= */
+
+function getVehicles(){
+  return JSON.parse(localStorage.getItem("vehicles_cache") || "[]");
+}
+
+function setVehicles(list){
+  localStorage.setItem("vehicles_cache", JSON.stringify(list));
+  fillVehicleSelect();
+}
+
+async function refreshVehicles(showMessage = true){
+  try {
+    if (showMessage) {
+      setEtat("Actualisation des véhicules en cours...", "info");
+    }
+
+    if (!navigator.onLine) {
+      fillVehicleSelect();
+      setEtat("Téléphone hors ligne : véhicules offline utilisés.", "info");
+      return;
+    }
+
+    const res = await fetch(`${API}/${DOC_ID}/tables/${TABLE_VOITURE}/records`, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${API_KEY}`
+      }
+    });
+
+    const txt = await res.text();
+
+    if (!res.ok) {
+      setEtat("Erreur API véhicules :\n" + txt, "err");
+      return;
+    }
+
+    const data = JSON.parse(txt);
+
+    const vehicles = data.records
+      .map(r => ({
+        id: r.id,
+        ticket: String(r.fields.Ticket_Voiture || "").trim()
+      }))
+      .filter(v => v.id && v.ticket)
+      .sort((a,b) => a.ticket.localeCompare(b.ticket, "fr"));
+
+    setVehicles(vehicles);
+    fillVehicleSelect();
+
+    setEtat("Véhicules actualisés : " + vehicles.length + " trouvé(s).", "ok");
+
+  } catch (e) {
+    console.error(e);
+    fillVehicleSelect();
+    setEtat("Erreur actualisation véhicules :\n" + (e.message || e), "err");
+  }
+}
+
+function fillVehicleSelect(){
+  const vehicles = getVehicles();
+  const selectedId = localStorage.getItem("vehicule_id") || "";
+
+  $("vehiculeSelect").innerHTML =
+    `<option value="">-- Sélectionner un véhicule --</option>` +
+    vehicles.map(v =>
+      `<option value="${escapeHtml(v.id)}">${escapeHtml(v.ticket)}</option>`
+    ).join("");
+
+  if (selectedId) $("vehiculeSelect").value = selectedId;
+}
+
+function selectVehicleById(id){
+  const vehicles = getVehicles();
+  const v = vehicles.find(x => String(x.id) === String(id));
+
+  if (!v) {
+    localStorage.setItem("vehicule_id", String(id));
+    $("vehiculeInfo").textContent = "Véhicule inconnu en cache";
+    $("vehiculeSelect").value = "";
+    return;
+  }
+
+  localStorage.setItem("vehicule_id", String(v.id));
+  localStorage.setItem("vehicule_ticket", v.ticket);
+
+  $("vehiculeInfo").textContent = v.ticket;
+  $("vehiculeSelect").value = String(v.id);
+}
+
+function selectVehicleFromList(){
+  const id = $("vehiculeSelect").value;
+
+  if (!id) {
+    localStorage.removeItem("vehicule_id");
+    localStorage.removeItem("vehicule_ticket");
+    $("vehiculeInfo").textContent = "Aucun véhicule sélectionné";
+    return;
+  }
+
+  selectVehicleById(id);
+  setEtat("Véhicule sélectionné.", "ok");
+}
+
+function loadSelectedVehicle(){
+  const id = localStorage.getItem("vehicule_id");
+  const ticket = localStorage.getItem("vehicule_ticket");
+
+  if (id && ticket) {
+    $("vehiculeInfo").textContent = ticket;
+    $("vehiculeSelect").value = id;
+  } else {
+    $("vehiculeInfo").textContent = "Aucun véhicule sélectionné";
+  }
+}
+
+/* =========================
+   FILE OFFLINE DES SAISIES
+========================= */
+
+function getQueue(){
+  return JSON.parse(localStorage.getItem("pleins_queue") || "[]");
+}
+
+function setQueue(q){
+  localStorage.setItem("pleins_queue", JSON.stringify(q));
+  updatePending();
+}
+
+function updatePending(){
+  const count = getQueue().length;
+  $("pending").textContent = count + " saisie" + (count > 1 ? "s" : "") + " en attente";
+}
+
+function resetSaisie(){
+  $("dateHeure").value = nowFr();
+  $("kmTotal").value = "";
+  $("kmParcouru").value = "";
+  $("litrage").value = "";
+  $("conso").value = "";
+}
+
+function savePlein(){
+  const vehiculeId = localStorage.getItem("vehicule_id");
+  const ticket = localStorage.getItem("vehicule_ticket");
+
+  if (!vehiculeId || !ticket) {
+    return setEtat("Veuillez scanner un QR code ou sélectionner un véhicule.", "err");
+  }
+
+  const data = {
+    vehiculeId: Number(vehiculeId),
+    date: $("dateHeure").value || nowFr(),
+    kmTotal: num($("kmTotal").value),
+    kmParcouru: num($("kmParcouru").value),
+    litrage: num($("litrage").value)
+  };
+
+  if (!data.kmTotal) return setEtat("Veuillez saisir le kilométrage total.", "err");
+  if (!data.litrage) return setEtat("Veuillez saisir le litrage.", "err");
+
+  const q = getQueue();
+  q.push(data);
+  setQueue(q);
+
+  resetSaisie();
+  setEtat("Saisie enregistrée sur le téléphone.", "ok");
+
+  if (navigator.onLine) syncNow(false);
+}
+
+/* =========================
+   SYNCHRONISATION
+========================= */
+
+async function syncNow(showMessage = true){
+  const q = getQueue();
+
+  if (!q.length) {
+    if (showMessage) setEtat("Aucune saisie à synchroniser.", "ok");
+    return;
+  }
+
+  if (!navigator.onLine) {
+    setEtat("Hors ligne : synchronisation impossible.", "info");
+    return;
+  }
+
+  setEtat("Synchronisation en cours...", "info");
+
+  const restants = [];
+
+  for (const item of q) {
+    try {
+      const res = await fetch(`${API}/${DOC_ID}/tables/${TABLE_SAISIES}/records`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          records: [{
+            fields: {
+              Date_Heure_Saisie: item.date,
+              "Véhicule_Saisie": item.vehiculeId,
+              Km_Total_Saisie: item.kmTotal,
+              Km_Parcouru_Saisie: item.kmParcouru,
+              Litrage_Saisie: item.litrage
+            }
+          }]
+        })
+      });
+
+      if (!res.ok) throw new Error(await res.text());
+
+    } catch (e) {
+      console.error(e);
+      restants.push(item);
+    }
+  }
+
+  setQueue(restants);
+
+  if (restants.length) {
+    setEtat("Synchronisation partielle : certaines saisies restent en attente.", "err");
+  } else {
+    setEtat("Synchronisation réussie.", "ok");
+  }
+}
+
+function escapeHtml(v){
+  return String(v ?? "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#039;");
+}
+</script>
+
+</body>
+</html>
